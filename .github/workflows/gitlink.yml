@@ -1,0 +1,142 @@
+name: gitlink
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Direct URLs (separate with space, comma, or new line)'
+        required: true
+        type: string
+      custom_name:
+        description: 'Custom name (single file → renames; multiple → prefix)'
+        required: false
+        type: string
+        default: ''
+      password:
+        description: 'ZIP password (optional – applied to split archives)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install aria2 and zip
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends aria2 zip
+
+      - name: Download files (parallel, 16 connections each)
+        shell: bash
+        run: |
+          URLS=$(echo "${{ github.event.inputs.url }}" | tr ',' ' ' | tr '\n' ' ')
+          mkdir -p downloads
+          
+          download() {
+            local url=$1
+            aria2c --console-log-level=error \
+                   --split=16 --max-connection-per-server=16 --min-split-size=1M \
+                   --dir=downloads "$url"
+          }
+          export -f download
+          
+          arr=($URLS)
+          for i in "${!arr[@]}"; do
+            download "${arr[$i]}" &
+            if (( (i+1) % 4 == 0 )); then wait; fi
+          done
+          wait
+
+      - name: Apply custom naming (keeping extensions)
+        run: |
+          CUSTOM="${{ github.event.inputs.custom_name }}"
+          if [ -n "$CUSTOM" ]; then
+            cd downloads
+            files=(*)
+            if [ ${#files[@]} -eq 1 ]; then
+              orig="$files"
+              ext="${orig##*.}"
+              mv "$orig" "${CUSTOM}.${ext}"
+            else
+              for f in "${files[@]}"; do
+                mv "$f" "${CUSTOM}_$f"
+              done
+            fi
+            cd ..
+          fi
+
+      - name: Split large files (>95MB) into <100MB zip parts (or apply password)
+        run: |
+          PASS="${{ github.event.inputs.password }}"
+          cd downloads
+          for file in *; do
+            [ -f "$file" ] || continue
+            SIZE=$(stat -c%s "$file")
+            LIMIT=$((95 * 1024 * 1024))
+            if [ -n "$PASS" ] || [ "$SIZE" -gt "$LIMIT" ]; then
+              echo "Processing $file (size: $SIZE bytes) -> splitting into 95MB parts"
+              PASS_ARG=""
+              [ -n "$PASS" ] && PASS_ARG="-P $PASS"
+              zip $PASS_ARG -s 95m "${file}.zip" "$file"
+              rm "$file"
+            fi
+          done
+          cd ..
+
+      - name: Preserve workflow & README while pushing only downloads (orphan branch)
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }} full_repo
+          cd full_repo
+
+          git checkout --orphan new_main
+
+          # Remove everything except .github/, README.md, and .git
+          find . -mindepth 1 \
+            ! -path './.github*' \
+            ! -path './README.md' \
+            ! -path './.git*' \
+            -exec rm -rf {} + 2>/dev/null || true
+
+          mkdir -p .github/workflows
+          cp -r ../downloads/* .
+
+          git add -A
+          git commit -m "Update downloads [skip ci]"
+
+          git push origin --delete main 2>/dev/null || true
+          git push -f origin new_main:main
+
+          cd ..
+          ls downloads > file_list.txt
+          rm -rf full_repo downloads
+
+      - name: Print raw download links + rerun link + reassembly instructions
+        run: |
+          REPO="${{ github.repository }}"
+          BRANCH="main"
+          echo "=============================="
+          echo "📦 Files uploaded to main branch (history completely wiped):"
+          echo "=============================="
+          while IFS= read -r file; do
+            if [ -n "$file" ]; then
+              ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$file'))")
+              RAW_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/$ENCODED"
+              echo "🔗 $file → $RAW_URL"
+            fi
+          done < file_list.txt
+          echo "=============================="
+          echo ""
+          echo "📌 If files were split into .zip, .z01, .z02, etc.:"
+          echo "   To reassemble: zip -s 0 original.zip --out combined_file"
+          echo "   Then unzip combined_file (use password if set)."
+          echo ""
+          echo "🔄 Rerun this workflow (paste your new URLs):"
+          echo "https://github.com/$REPO/actions/workflows/gitlink.yml"
+          echo "=============================="
+          rm -f file_list.txt
